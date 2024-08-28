@@ -1,0 +1,6 @@
+{
+    "C_Cpp.default.includePath": [
+        "/home/julien/src/tvm_unity/include/",
+        "/home/julien/src/tvm_unity/3rdparty/dlpack/include/"
+    ]
+}
