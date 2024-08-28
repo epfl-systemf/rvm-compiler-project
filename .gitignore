@@ -1,0 +1,16 @@
+# latex junk
+*.blg
+*.fdb_latexmk
+*.fls
+*.ist
+*.log
+*.synctex.gz
+*.aux
+*.glo
+*.out
+*.bbl
+*.nav
+*.snm
+*.toc
+*_minted*
+__pycache__
