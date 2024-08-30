@@ -237,7 +237,9 @@ void conv1d_im2col_tile(int32_t *data, int32_t *kernels, int32_t *out) {
     \label{lst:conv1d_im2col_tile_acc}
 \end{listing}
 
-At this point, the code in listing \ref{lst:conv1d_im2col_tile_acc} performs around 4x faster than the scalar code of listing \ref{lst:conv1d_scalar}. Still, we can further optimize this routine. Profiling the code reveals that the majority of the time is still spent simply doing im2col, and that the computation practically adds nothing to the total runtime, once again due to the nonblocking nature of the instructions. There is ample time for the matrix load and multiply to compute before the im2col loop provides the next piece of data. However, notice that the im2col result is unecessarily computed for every $tile_i$ iteration: the result is not dependent on $tile_i$ at all. If we could reorder the loops and share the value of $y$ for every iteration of $tile_i$, then in theory we may be able to speed up by a factor of up to $\frac{OC}{TILE}$. In reality, since we are reducing over the $c$ loop, we would need to store the tiles for each $tile_i$ in different registers, which is not feasible as we only have 8. But 8 registers is still enough registers to store 4 different $tile_i$ iterations, so we can unroll by a factor of 4. Listing \ref{lst:conv1d_im2col_tile_acc_unroll} shows this final optimization; as expected, it yields around a 4x speedup from the previous iteration.
+At this point, the code in listing \ref{lst:conv1d_im2col_tile_acc} performs around 4x faster than the scalar code of listing \ref{lst:conv1d_scalar}. Still, we can further optimize this routine. Profiling the code reveals that the majority of the time is still spent simply doing im2col, and that the computation practically adds nothing to the total runtime, once again due to the nonblocking nature of the instructions. There is ample time for the matrix load and multiply to compute before the im2col loop provides the next piece of data. However, notice that the im2col result is unecessarily computed for every $tile_i$ iteration: the result is not dependent on $tile_i$ at all. If we could reorder the loops and share the value of $y$ for every iteration of $tile_i$, then in theory we may be able to speed up by a factor of up to $\frac{OC}{TILE}$. In reality, since we are reducing over the $c$ loop, we would need to store the tiles for each $tile_i$ in different registers, which is not feasible as we only have 8. But 8 registers is still enough registers to store 4 different $tile_i$ iterations, so we can unroll by a factor of 4. Listing \ref{lst:conv1d_im2col_tile_acc_unroll} shows this optimization; as expected, it yields around a 4x speedup from the previous iteration.
+
+We can still do slightly better with some final optimizations. The bottleneck is still in the scalar section at this point. We've attempted to do less of it, now we will try to make it go faster. At the innermost loop for im2col (r), we are currently doing a branch for a bounds check. However, as we are only branching on the value to store at \verb|y[j][r]|, we can instead implement this conditional through bitwise logic. This adds slightly more arithmetic instructions, but saves on branches, whose misprediction latency tends to be larger. Next, when accessing arrays, we are always writing out the expression to compute the offset from the indices. This would of course be quite slow if lowered directly by the compiler, but Clang and GCC are capable of generating efficient code for these sorts of circumstances. Still, it turns out that writing out the accumulators lets the compiler save a couple instructions. In all, these tiny differences blow up to saving about 5\% of the entire runtime, being at the inside of this loop. 
 
 \begin{listing}
     \centering
@@ -296,9 +298,12 @@ void conv1d_im2col_tile(int32_t *data, int32_t *kernels, int32_t *out) {
     \label{lst:conv1d_im2col_tile_acc_unroll}
 \end{listing}
 
+% rewrite this to explicitly name user-scheduled languages, and be a bit more clear about what scheduling is
+% tell that this is not a complete literature survey 
 In this section we have seen firsthand the impacts that simply reorganizing data movement and computation can have. The routines we started and ended with employ arguably the same algorithm, are written in the same programming language, but have vastly different performance characteristics. We can also see the blowup in complexity incurred by these optimizations. What was once 5 lines of for loops has become a mess of tiled loops and inline assembly; at minimum, it is no longer immediately evident what the program is supposed to do. This forms the basis for a key concept in the tools discussed further in this report: the idea that these so-called ``scheduling'' details can be separated from the algorithm, or the core functionality, of a program. This idea was popularized by the tool Halide, which offered the ability to incrementally rewrite the schedule of some simple algorithmic description, achieving the same performance results as hand-tuned programs while greatly reducing the effort required to develop and debug. TVM, which we will discuss next, furthered Halide's automation capabilities and optimized the workflow towards writing tensor programs for machine learning.
 
 % can we include somewhere why it's not feasible for traditional compilers to just do it?
+
 
 \section{TVM}
 
@@ -450,6 +455,18 @@ As a motivating example, most devices are implemented under the umbrella of the 
 In a sense, this lack of expressibility defeats the advantage a user-scheduled language can offer: the schedule of the program becomes an incomplete picture of its performance, diminishing its utility. The custom compiler passes or hand-tuned microkernel routines instead become the focal point to ensure optimal performance on hardware. The next two tools we look at, while disparate in their approaches and goals, both avoid this expressibility problem by  offering the programmer near complete control over the generated code, while maintaining the highly structured aspects of a user-scheduled language. Our next language in particular, Exo, offers explicit constructs for managing the state of hardware accelerators.
 
 
+
+% just give the basic unoptimized matmul in TVM IR
+
+% show how we can tile it with one of the scheduling operators
+
+% now we would like to replace the macc in the inner k loop with matmul
+% but we cannot, we have to replace a load/store as well
+% this isn't efficient
+
+% use amx as example
+
+
 \begin{listing}
 \centering
 \begin{minted}[
@@ -479,17 +496,502 @@ TVM_DLL int32_t matmul(void* args, int32_t* arg_type_ids, int32_t num_args,
 
 \section{Exo}
 
+% TODO: talk about the formal aspect here
+Exo \cite{exo} is a user-scheduled language implemented as a DSL embedded in Python, similar to TVM. Exo expands upon languages like Halide and TVM with the concept of \textit{exocompilation}: instead of deferring to the compiler for critical decisions on instruction selection, accelerator memory management, etc., the programmer is given control.  Unlike TVM, Exo has no backends or targets. All Exo provides is a language with a standard set of scheduling directives, and constructs for the programmer to express their own hardware in a library which can be used by the schedule. In this section, we will see how Exo can be applied in the practical setting of our convolution routine.
+
+To introduce Exo, we will start by expressing the ``direct translation" convolution routine from Listing \ref{lst:conv1d_scalar}. This will serve as our algorithm, which we will continually rewrite to improve performance. Listing \ref{lst:conv1d_scalar_exo} shows the code. 
+
+\begin{listing}
+\centering
+\begin{minted}[
+    baselinestretch=1.1,
+    fontsize=\small,
+]{python}
+# TODO: FIX THESE INDICES!
+@proc
+def generic_conv1d(
+    data: i32[C, W],
+    kernels: i32[K, C, R],
+    out: i32[K, W],
+):
+    # do the convolution
+    for k in seq(0, K):
+        for i in seq(0, W):
+            # zero out the result memory
+            out[k, i] = 0.0
+            for c in seq(0, C):
+                for r in seq(0, R):
+                    y: i32
+                    if i + r < W:
+                        y = data[c, i + r]
+                    else:
+                        y = 0
+                    out[k, i] += kernels[k, c, r] * y
+\end{minted}
+\caption{Base algorithm definition in Exo.}
+
+\label{lst:conv1d_scalar_exo}
+\end{listing}
+
+The structure closely resembles that of a real Python program, but like TVM, each construct in the code is compiled down to a representation within the Exo language. Now, we will apply scheduling directives to optimize it. We'll follow a slightly different order from the transformations applied by hand, as a certain order makes it easiest to express. Namely, we'd like to do all of our tiling beforehand, so we start with those directives:
+
+\begin{minted}[
+    baselinestretch=1.1,
+    fontsize=\small,
+]{python}
+# Before scheduling, grab cursors to the object code.
+k_loop = p.find("for k in _:_")
+i_loop = p.find("for i in _:_")
+c_loop = p.find("for c in _:_")
+y_alloc = p.find("y : _")
+y_assign = p.find("y = data[_]")
+
+# Tile outer loops to TILE size for RVM
+p, _ = tile_loops(p, [(k_loop, TILE), (i_loop, TILE)], perfect=True)
+p, _ = tile_loops(p, [(k_loop, 4)], perfect=True)
+k_loop_reg = p.find("for koi in _:_")
+p = reorder_loops(p, k_loop_reg)
+\end{minted}
+In this snippet and those that come, \verb|p| refers to the \verb|generic_conv1d| function defined above, passed as an object to this function which manipulates the schedule. 
+
+Exo's scheduling directives need ``cursors'' that point to places in the program to manipulate. You can provide these as strings which are pattern matched against parts of the AST at the point the directive is applied, or grab a cursor to that node as an object, which is carried throughout transformations. Here we grab these references to the parts of the code we want to transform for convenience. Next, we apply a directive called \verb|tile_loops|, similar to \verb|split| from TVM, to tile these loop nests by the factor of the tile size. We tile once again to handle the 4x compute optimization. Finally, we reorder the loop corresponding to the 4 registers which we will unroll later.
+
+If we print \verb|p| at this point using Exo, we get the following output:
+\begin{minted}[
+    baselinestretch=1.1,
+    fontsize=\small,
+]{python}
+def exo_conv1d_tile_lt_kw(data: i32[4, 16] @ DRAM,
+                          kernels: i32[16, 4, 4] @ DRAM,
+                          out: i32[16, 16] @ DRAM):
+    for koo in seq(0, 1):
+        for io in seq(0, 4):
+            for koi in seq(0, 4):
+                for ki in seq(0, 4):
+                    for ii in seq(0, 4):
+                        out[ki + 4 * (4 * koo + koi), ii + 4 * io] = 0.0
+                        for c in seq(0, 4):
+                            for r in seq(0, 4):
+                                y: i32 @ DRAM
+                                if ii + r + 4 * io < 16:
+                                    y = data[c, ii + r + 4 * io]
+                                else:
+                                    y = 0
+                                out[ki + 4 * (4 * koo + koi),
+                                    ii + 4 * io] += kernels[ki + 4 *
+                                                            (4 * koo + koi), c,
+                                                            r] * y
+\end{minted}
+Now we would like to reorder the \verb|c| output to surround the inner tile dimensions, since inside each iteration of \verb|c| we'd like to do a single tile-size im2col and matrix multiplication. Exo won't let us reorder the loop with the initialization of \verb|out[]| in the way though,
+% (why?)
+ so we will separate them out first. But we also want to stage \verb|out[]| to a new buffer, since the compute loop is only operating on the accelerator's memory, not directly to \verb|out[]| in the function signature. We will see later how to express that this buffer corresponds to the register held in our accelerator. 
+
+\begin{minted}[
+baselinestretch=1.1,
+fontsize=\small,
+]{python}
+# Stage output to out_tile
+p, (_, out_tile, body, _) = auto_stage_mem(
+    p, p.find_loop("c").expand(1, 0), "out", "out_tile", rc=True
+)
+p = autolift_alloc(p, out_tile, max_size=4 * 4 * 4, dep_set=["koi","ki","ii"])
+
+# Block the zero initialization and store blocks
+p = fission_as_much_as_possible(p, body)
+p = fission_as_much_as_possible(p, body[0])
+
+# Reorder c loop to the top
+p = lift_scope_n(p, c_loop, 3)
+\end{minted}
+
+Exo provides a function \verb|auto_stage_mem| to handle the staging of out into a new memory. Here, we are describing the name of the new variable and in which block of code we want to replace the accesses to the original memory. Exo auto-inserts code to copy over the contents of the staged memory back to the original once the loop terminates. 
+Next, we'd like to lift the newly generated allocation for \verb|out_tile| so that it spans 4 tile registers, and then we can finally reorder the loops so that the tile axes are on the inside. Exo provides a directive in its standard library called \verb|lift_alloc|, which moves the allocation out of a loop (this transformation is always correct), and another called \verb|expand_dim| which adds another dimension to a buffer dependent on some index variable. We can easily combine these for each index to achieve the result we want, but Exo lends itself well to composing these rules for concise code. In this case, we have defined a custom rewrite for automatically applying this \verb|lift_alloc|-\verb|expand_dim| process, until we have traversed enough parent loops to reach some threshold size of the new buffer:
+\begin{minted}[
+    baselinestretch=1.1,
+    fontsize=\small,
+    ]{python}
+def autolift_alloc(p, alloc_c, dep_set=None, max_size=0, lift=True):
+    """
+    for i in seq(0, 10):
+        for j in seq(0, 20):
+            a : R          <- alloc_c, dep_set = {'i'}
+            a[i] = ...
+    ---->
+    a : R[10]              <- if size is less than max_size
+    for i in seq(0, n):
+        for j in seq(0, m):
+            a[i] = ...
+    """
+    alloc_c = p.forward(alloc_c)
+    loop_c = get_enclosing_loop(p, alloc_c)
+    accum_size = 1
+    while True:
+        try:
+            if not isinstance(loop_c, pc.ForCursor):
+                break
+            if dep_set == None or loop_c.name() in dep_set:
+                if (
+                    isinstance(loop_c.hi(), LiteralCursor)
+                    and accum_size * loop_c.hi().value() <= max_size
+                ):
+                    p = expand_dim(p, alloc_c, loop_c.hi().value(), loop_c.name())
+                    accum_size = accum_size * loop_c.hi().value()
+                    if lift:
+                        p = lift_alloc(p, alloc_c)
+            loop_c = loop_c.parent()
+        except:
+            break
+    return p
+\end{minted}
+
+After applying \verb|autolift_alloc|, we can fission (i.e. separate the statements into their own loops) the new blocks for zeroing and storing \verb|out_tile|, as these do not depend on the \verb|c| loop. Finally, we reorder the \verb|c| loop so that is on the outside as we intended. Note that these functions (\verb|fission_as_much_as_possible|, \verb|lift_scope_n|)  are also custom transformations composed from functions given by Exo. Printing \verb|p| now, we get
+\begin{minted}[
+    baselinestretch=1.1,
+    fontsize=\small,
+    ]{python}
+def exo_conv1d_tile_lt_kw(data: i32[4, 16] @ DRAM,
+                          kernels: i32[16, 4, 4] @ DRAM,
+                          out: i32[16, 16] @ DRAM):
+    for koo in seq(0, 1):
+        for io in seq(0, 4):
+            out_tile: i32[4, 4, 4] @ DRAM
+            for koi in seq(0, 4):
+                for ki in seq(0, 4):
+                    for ii in seq(0, 4):
+                        out_tile[koi, ki, ii] = 0.0
+            for c in seq(0, 4):
+                for koi in seq(0, 4):
+                    for ki in seq(0, 4):
+                        for ii in seq(0, 4):
+                            for r in seq(0, 4):
+                                y: i32 @ DRAM
+                                if ii + r + 4 * io < 16:
+                                    y = data[c, ii + r + 4 * io]
+                                else:
+                                    y = 0
+                                out_tile[koi, ki,
+                                         ii] += kernels[ki + 4 *
+                                                        (4 * koo + koi), c,
+                                                        r] * y
+            for koi in seq(0, 4):
+                for ki in seq(0, 4):
+                    for ii in seq(0, 4):
+                        out[ki + 4 * (4 * koo + koi),
+                            ii + 4 * io] = out_tile[koi, ki, ii]
+\end{minted}
+
+We still have to apply the im2col transformation, where we separate out the setting of \verb|y| into its own loop nest, making \verb|y| a large buffer in the process. We can see that this is a simple matter of applying fission between setting \verb|y| and doing the multiply-accumulate, then lifting the \verb|y| allocation up the loop nest. Afterwards, we stage the kernel and data matrices into new buffers just like with the output. We have:
+
+\begin{minted}[
+    baselinestretch=1.1,
+    fontsize=\small,
+    ]{python}
+# Stage y
+p = autolift_alloc(p, y_alloc, max_size=4 * 4, dep_set=["r","ii"])
+p = lift_alloc(p, y_alloc, n_lifts=2)
+
+# Fission the initialization loop and remove redundant loops
+p = fission_as_much_as_possible(p, y_assign.parent())
+p = remove_redundant_loops(p, y_assign.parent(), num=2)
+
+# Stage kernels to kernel_tile and y to data_tile
+ki_loop = p.forward(c_loop).body()[2].body()[0]
+p, (kernel_alloc, _, _, _) = auto_stage_mem(
+    p, ki_loop, "kernels", "kernel_tile", rc=True
+)
+p = simplify(expand_dim(p, kernel_alloc, 4, ki_loop.parent().name()))
+p = lift_alloc(p, kernel_alloc)
+p, (data_alloc, _, _, _) = auto_stage_mem(
+    p, ki_loop.parent(), "y", "data_tile", rc=True
+)
+\end{minted}
+
+We ommitted the result of the code, since we have reused many of the same constructs as previously.
+
+We are now ready to replace the loops in this code with offloads to our accelerator. For this purpose, Exo offers a code replacement feature, \verb|replace()|, like TVM's tensorize. Like tensorize, strides and offsets are automatically handled when unifying against the function body. But Exo's implementation differs in 2 key ways:
+\begin{enumerate}
+    \item The functions which provide the ``specification'' may take an argument which is not in main memory. Whereas TVM's functions had to take types of \verb|T.Buffer|, an arbitrary annotation for the location (e.g. \verb|@ DRAM|) is permitted. Combined with Exo's ability to express custom memories, this allows for fine-grain control over which parts of the code are replaced, rather than having to replace all accelerator code at once. 
+    \item The replacement implementation is not limited to invoking a C function or pasting LLVM IR. A piece of C code may be inserted directly. This works once again in tandem with Exo's custom memory support to allow, for example, implementations consisting of inline assembly using parameterized registers. 
+\end{enumerate}
+
+\verb|replace()| takes as arguments the procedure to replace, the segment of the code within that procedure to match, and the function whose body will be unified with the code selected. Let's see how the functions corresponding to the instruction specifications are written:
+
+\begin{minted}[
+    baselinestretch=1.1,
+    fontsize=\small,
+    ]{python}
+@instr(
+    'asm volatile("mld.w "{dst_int}", (%1), %0"\
+    :: "r"(4*({src}.strides[0])), "r"(&{src_data}));'
+)
+def rvm_mld(dst: [i32][4, 4] @ RVM_TILE, src: [i32][4, 4] @ DRAM):
+    assert stride(src, 1) == 1
+    assert stride(dst, 1) == 1
+
+    for i in seq(0, 4):
+        for j in seq(0, 4):
+            dst[i, j] = src[i, j]
+\end{minted}
+
+The arguments for load are of type \verb|RVM_TILE| for the destination, corresponding to our register file, and the source is an address in main memory. The function body is nothing more than standard Exo code, whose semantics can be understood without knowing the accelerator's details. Here, we are just copying from one array to the next. But what is \verb|RVM_TILE| and how did we define it? 
+
+\begin{minted}[
+    baselinestretch=1.1,
+    fontsize=\small,
+    ]{python}
+class RVM_TILE(StaticMemory):
+    NUM_RVM_TILES = 8
+    StaticMemory.init_state(NUM_RVM_TILES)
+    tile_dict = {}
+
+    ...
+
+    @classmethod
+    def alloc(cls, new_name, prim_type, shape, srcinfo):
+        if not (shape[0].isdecimal() and int(shape[0]) == 4):
+            raise MemGenError("Number of tile rows must be 4.")
+        if not (shape[1].isdecimal() and int(shape[1]) == 4):
+            raise MemGenError("Number of tile columns must be 4.")
+
+        tile_num = cls.find_free_chunk()
+        cls.mark(tile_num)
+        cls.tile_dict[new_name] = tile_num
+        return f'#define {new_name} "m{7-tile_num}"'
+
+    @classmethod
+    def free(cls, new_name, prim_type, shape, srcinfo):
+        tile_num = cls.tile_dict[new_name]
+        del cls.tile_dict[new_name]
+        cls.unmark(tile_num)
+        return f"#undef {new_name}"
+
+\end{minted}
+
+% TODO: Check the semantics bits with Yuka
+Exo allows us to define our custom memories as custom classes which we can invoke as seen above. Semantically, these classes are all viewed as residing in global, dynamically allocated memory. Thus, a directive \verb|set_memory| exists to freely change the selected memory for a specific allocation in a program. The difference comes down to the code generation phase, when the Exo program is lowered to C: the implementations of the methods in this class dictate how to allocate a buffer, how to free it, etc. In our case, ``allocation" is simply a matter of selecting the right register. For this we just need to define a string literal which we can use in our inline assembly statements. In our implementation, the \verb|alloc()| function tracks the allocated registers for each named buffer in a dictionary and maintains a bitmap of the free registers. Even though we have called it a memory allocator, what we have essentially implemented here is a trivial register allocator, something only a compiler would typically have control of! But this class is simply defined in our Python module, and does not reside in any sort of compiler backend for Exo. % why important?
+
+Going back to the instructions, we define others in a similar fashion. For example, here is the definition for our matrix multiplication:
+
+\begin{minted}[
+    baselinestretch=1.1,
+    fontsize=\small,
+    ]{python}
+@instr('asm volatile("mmasa.w "{md_int}", "{ms1_int}", "{ms2_int});')
+def rvm_mmasa(
+    md: [i32][4, 4] @ RVM_TILE, ms1: [i32][4, 4] @ RVM_TILE,
+     ms2: [i32][4, 4] @ RVM_TILE
+):
+    assert stride(md, 1) == 1
+    assert stride(ms1, 1) == 1
+    assert stride(ms2, 1) == 1
+    for i in seq(0, 4):
+        for j in seq(0, 4):
+            for k in seq(0, 4):
+                md[i, j] += ms2[i, k] * ms1[j, k]
+\end{minted}
+
+You can see once again that the specifications here are nothing more than scalar code, like how we'd write unoptimized code for the CPU. The \verb|instr| decorator provides the implementation where we invoke inline assembly. The parameters \verb|md_int|, \verb|ms1_int|, etc. are filled in by Exo based on the name of the variable passed to the function.
+
+To use these instructions, we apply \verb|set_memory| and \verb|replace| as follows (\verb|replace_all| is a wrapper around replace that applies it wherever applicable):
+
+\begin{minted}[
+    baselinestretch=1.1,
+    fontsize=\small,
+    ]{python}
+# Set adequate memories
+p = set_memory(p, y_alloc, DRAM_STATIC)
+p = set_memory(p, out_tile, RVM_TILE)
+p = set_memory(p, kernel_alloc, RVM_TILE)
+p = set_memory(p, data_alloc, RVM_TILE)
+
+# Replace inner loops to calls to RVM instructions
+p = replace_all(p, [rvm_mzero, rvm_mst, rvm_mld, rvm_mmasa])
+\end{minted}
+% TODO: it should be X-HEEP memory instead of DRAM_STATIC
+The resulting Exo code has all offloadable sections replaced by calls to the functions we wrote earlier. Once again, from the Exo perspective, these are just calls to other Exo functions, but they carry a special meaning during code generation which allows them to represent our assembly instructions. 
+
+\begin{minted}[
+    baselinestretch=1.1,
+    fontsize=\small,
+    ]{python}
+def exo_conv1d_tile_lt_kw(data: i32[4, 16] @ DRAM,
+                          kernels: i32[16, 4, 4] @ DRAM,
+                          out: i32[16, 16] @ DRAM):
+    for koo in seq(0, 1):
+        for io in seq(0, 4):
+            out_tile: i32[4, 4, 4] @ RVM_TILE
+            for koi in seq(0, 4):
+                rvm_mzero(out_tile[koi + 0, 0:4, 0:4])
+            for c in seq(0, 4):
+                y: i32[4, 4] @ DRAM_STATIC
+                for ii in seq(0, 4):
+                    for r in seq(0, 4):
+                        if ii + r + 4 * io < 16:
+                            y[ii, r] = data[c, ii + r + 4 * io]
+                        else:
+                            y[ii, r] = 0
+                kernel_tile: i32[4, 4, 4] @ RVM_TILE
+                data_tile: i32[4 - 0, 4 - 0] @ RVM_TILE
+                rvm_mld(data_tile[0:4, 0:4], y[0:4, 0:4])
+                for koi in seq(0, 4):
+                    rvm_mld(
+                        kernel_tile[koi + 0, 0:4, 0:4],
+                        kernels[4 * koi + 16 * koo + 0:4 * koi + 16 * koo + 4,
+                                c + 0, 0:4])
+                    rvm_mmasa(out_tile[koi + 0, 0:4, 0:4], data_tile[0:4, 0:4],
+                              kernel_tile[koi + 0, 0:4, 0:4])
+            for koi in seq(0, 4):
+                rvm_mst(
+                    out_tile[koi + 0, 0:4, 0:4],
+                    out[4 * koi + 16 * koo + 0:4 * koi + 16 * koo + 4,
+                        4 * io + 0:4 * io + 4])
+\end{minted}
+
+For our final transformations, we'd like to unroll each of the \verb|koi| loops, and allocate 4 different \verb|out_tile|s, rather than having only one with an extra dimension. Exo provides us with a routine to unroll loops, but also to ``unroll the buffer'': replace an allocation for a constant size $n$ on a given dimension with $n$ buffers without that dimension. We utilize these directives below.
+
+\begin{minted}[
+    baselinestretch=1.1,
+    fontsize=\small,
+    ]{python}
+# Clean up
+p = unroll_loop(p, "koi")
+p = unroll_loop(p, "koi")
+p = unroll_loop(p, "koi")
+p = simplify(p)
+p = unroll_buffer(p, kernel_alloc, 0)
+p = reuse_buffer(p, "kernel_tile_0: _", "kernel_tile_3: _")
+\end{minted}
+
+At this point, using Exo, we're at about 95\% of the performance (in terms of 1/execution time) of our manual routine. How can we express the remaining 5\%? When writing originally, we added some optimizations for the indexing expressions in the im2col loops, since it was generating better code with Clang. How can we control this from Exo? Indexing expressions in Exo itself are represented as abstract multidimensional array lookups, and are lowered to the real expressions when the C code is generated. While Exo gave us great flexibility in instruction selection, it does not offer us control over this aspect of compilation. We've ended up in a situation similar to TVM: we are in a position of having to trust a compiler to generate good code in a later phase, since although we know of an optimization, we cannot schedule the language where we could apply it. 
+
+While the example of indexing expressions is particularly salient in our case, other limitations may manifest from Exo's design. Exo thrives with workloads dominated by compute-heavy for loops with simple control, usually dictated by affine expressions. But the benefits of a scheduling language need not be limited to these workloads. We write many programs where a simple expression of the algorithm exists, but we ship a vastly more complicated variant to maximize performance. Such programs could benefit from a user-scheduled languages, but as they may be written by hand to make use of features such as structs which Exo currently has no answer to. Transformations on these features exist too, such as turning an array of structs into a struct of arrays, typically used to increase locality. % TODO: why relevant
+
+These limitations bring us to our final tool: OptiTrust. OptiTrust foregoes a DSL and allows the user to perform source-to-source transformations on C and C++ code. We will see how OptiTrust can be applied in our case study, specifically to make the indexing optimization that we were not able to with Exo.
+
+\section{OptiTrust}
+
+OptiTrust is a tool allowing for source-to-source transformations of C/C++ code. These transformations, similar to the scheduling rules we have seen previously, are driven by an OCaml script which manipulates parts an AST corresponding to the program. OptiTrust's primary goal is not just to produce fast software, but to produce \textit{correct} fast software. OptiTrust thus places a large focus on performing optimizations that preserve the invariants of the source.
+
+In this section we will demonstrate OptiTrust on the 1D convolution routine, attempting to apply the same process as we did with Exo, and expanding on it as well. We will start with the C code for direct convolution, which is that of Listing \ref{lst:conv1d_scalar}. In our OCaml script for OptiTrust, we write a function of type \verb|unit -> unit| (so, it has side effects) which applies the various scheduling functions. OptiTrust provides a number of these and they work similar those we have seen in other tools. OptiTrust's code selection system works on a constraint system; all directives take in a \textit{target} to represent the location(s) in the code desired to be transformed, which are lists of constraints matching against parts of the AST. For example, the target \verb|[cFor "i"; occLast]| matches the AST node for the last occurence of a for loop statement with iteration index "i". Transformation functions take in targets and any other paremeters and return \verb|unit|, manipulating the AST as a side effect. The code in Listing \ref{lst:conv1d_optitrust_tile} shows the segment of the script used to tile the loops at the start, like we did in Exo.
+
+Many of the familiar constructs such as tiling, loop reordering, loop fission, etc.  exist in OptiTrust, as we see in Listing \ref{lst:conv1d_im2col_tile}. Like Exo, we can compose the provided rewrite rules to make our own, like the convenience function \verb|prefix_indices| which allows for bulk renaming of loop indices. OptiTrust lets us go a step further here, however. The user can write transformations which manipulate the AST itself. This gives quite extensive control. We will now see an instance where this control becomes useful.
+
+\begin{listing}
+\begin{minted}[
+    baselinestretch=1.1,
+    fontsize=\small,
+    ]{ocaml}
+(* tile according to size supported by accelerator *)
+!! Loop.tile (trm_int 4) ~index:"tile_i"
+ ~iter:TileIterGlobal ~bound:TileDivides [cFor "i"];
+!! Loop.tile (trm_int 4) ~index:"tile_j"
+ ~iter:TileIterGlobal ~bound:TileDivides [cFor "j"];
+!! Loop.reorder ~order:["tile_j"; "i"] [cFor "i"];
+(* tile again to have 4x compute *)
+!! Loop.tile (trm_int 4) ~index:"tile_i_hi"
+ ~iter:TileIterGlobal ~bound:TileDivides [cFor "tile_i"];
+!! Loop.reorder ~order:["tile_j"; "tile_i"] [cFor "tile_i"];
+
+(* sum a tile at a time *)
+!! Loop.hoist_alloc_loop_list [1; 1; 1;] [cVarDef "sum"];
+(* zeroing *)
+!! Loop.fission ~nest_of:3 [tBefore; cFor "k"; occFirst];
+(* storing *)
+!! Loop.fission ~nest_of:3 [tAfter; cFor "k"; occFirst];
+
+let prefix_indices (idxs: (string * target) list) (pfx: string): unit =
+let _ = (List.map (fun idx -> 
+    Loop.rename_index (pfx ^ "_" ^ fst idx) (snd idx)) idxs) in () in
+!! prefix_indices [("tile_i", [cFor "tile_i"; occFirst]);
+ ("i", [cFor "i"; occFirst]); ("j", [cFor "j"; occFirst])] "zero";
+!! prefix_indices [("tile_i", [cFor "tile_i"; occLast]);
+ ("i", [cFor "i"; occLast]); ("j", [cFor "j"; occLast])] "st";
+
+\end{minted}
+\caption{OCaml script to tile conv1d in OptiTrust. Each line beginning with \texttt{!!} is a scheduling directive whose effects can be viewed in a trace.}
+\label{lst:conv1d_optitrust_tile}
+\end{listing}
+
+Listing \ref{lst:conv1d_optitrust_data_kernel} shows the code for offloading loops to the accelerators. We also include the staging of memory which we accomplish using a combination of \verb|Variable.bind|, \verb|hoist_alloc|, and \verb|fission|. For the replacement parts, in Exo, we did this using \verb|replace|, which offered unification between code blocks and function bodies. We use a similar strategy by employing \verb|uninline| from OptiTrust. We define a function that gives the specification of the accelerator instruction (i.e. the code block we'd like to match against) and use \verb|uninline| to replace some code with a call to that function. Then, we can use another OptiTrust directive to replace this function call with another that invokes inline assembly, which serves as the implementation. We will deal with the implementation side shortly. For now, let's see how we perform replacement over our instruction specification.
+
+The first roadblock we would run into trying to use uninline is that of \textit{windowing}. That is, the code we are replacing is indexing into some offset of a large matrix (possibly with more dimensions), while the code we are replacing with assumes the passed pointer is the start of a 4x4 matrix. We have to account for the stride and offset, which TVM and Exo do behind the scenes as this problem is extremely common in their domains. OptiTrust, on the other hand, does not, and so unification would fail. However, this is where we can employ OptiTrust's flexibility: We can define our own rules to handle this windowing use case. When we encounter an indexing expression for an $n$ dimensional array, represented in OptiTrust by a special \verb|MINDEX| function, we can rewrite this as an index into an $n-1$ dimensional array where two of the axes have been ``folded`` into one. For example, if the lowest axis of a 3x3x3 matrix is folded, then we have a 3x9 matrix. We call this rule \verb|reduce_mindex|  From here we can rewrite the indexing only in terms of the indices which change in the loop. Any terms added to these indices are extracted out and rewritten as a pointer with the offset added. This is \verb|factor_window|. When we apply these, the index expression matches exactly that of the function assuming a 4x4 matrix, thus we are able to uninline.
+\begin{listing}
+    \begin{minted}[
+        baselinestretch=1.1,
+        fontsize=\small,
+        ]{ocaml}
+(* Data Load *)
+!! Variable.bind "data_tile" [cArrayRead "y"];
+Loop.hoist_alloc_loop_list [0; 0; 1; 1;] [cVarDef "data_tile"];
+Loop.fission ~nest_of:4 [tAfter; cArrayWrite "data_tile"];
+
+!! delete_loop [cFor "tile_i"; occFirst] [cFor "i"; occFirst];
+delete_loop [cFor "i"; occFirst] [cFor "j"; occIndex 1];
+
+!! Function.uninline ~fct:[cFunDef "rvm_mld"] [cFor "j"; occIndex 1];
+
+(* Kernel Load *)
+!! Variable.bind "kernel_tile" [cArrayRead "W"];
+Loop.hoist_alloc_loop_list [1; 0; 1;] [cVarDef "kernel_tile"];
+Loop.fission ~nest_of:3 [tAfter; cArrayWrite "kernel_tile"];
+!! delete_loop [cFor "j"; occIndex 1] [cFor "r"; occIndex 1];
+
+!! reduce_mindex 0 [cFun "MINDEX3"; occIndex 1];
+!! factor_window ["i"; "r"] [cMindexAcc "W";];
+!! Function.uninline ~fct:[cFunDef "rvm_mld"] [cFor "i"; occIndex 0];
+    \end{minted}
+    \caption{Staging and offloading of data and kernel loads.}
+    \label{lst:conv1d_optitrust_data_kernel}
+    \end{listing}
+
+We continue replacing segments of the code with offloads to the accelerator using uninline, until we have theoretically landed at the same point we left the Exo program. We can turn our attention to the original question prompting writing directly on C - can we apply our indexing optimization? Since OptiTrust is extensible, we can once again introduce new scheduling functions:
+
+\begin{minted}[
+    baselinestretch=1.1,
+    fontsize=\small,
+    ]{ocaml}
+!! Variable.bind_multi ~dest:[cIf (); tBefore] "ofs" [sExpr "tile_j * 4 + j + r"];
+!! Matrix_basic.elim_mindex [cMindex ~args:[[cVar "IC"]; [cVar "IW"];
+ [cVar "k"]; [cVar "ofs"]] ()];
+!! Matrix_basic.elim_mindex [nbMulti; cMindex ~args:[[cInt 4]; [cInt 4];
+[cVar "j"]; [cVar "r"]] ()];
+
+!! loopize_decl [cFor "r"; occFirst] [cVarDef "ofs"];
+!! Arith_basic.simplify [sExpr "0 + k * IW + ofs"];
+!! Variable.bind "drow_ofs" [sExpr "k * IW + ofs"];
+!! hoist_if [cIf ()] [cVarDef "drow_ofs"];
+!! loopize_decl ~loop_ind_in:(find_var_in_current_ast "ofs")
+ [cFor "r"; occFirst] [cVarDef "drow_ofs"];
+!! loopize_expr [cFor "tile_j"] "data_base" [sExpr "tile_j * 4"];
+!! loopize_expr [cFor "k"] "data_row" [sExpr "k * IW"]
+\end{minted}
+
+This section accomplishes the transformation by binding the indexing expression to a new variable, \verb|ofs|, expanding the calls to \verb|MINDEX| to mathematical expressions, and then applying a custom transformation dubbed \verb|loopize| to remove the dependence on the index so that the new variable can be accumulated itself. Continuing this way we are able to rewrite the expression exactly in the manner carried out by hand. Although these rules may be quite tailored to this use case, and may fail to apply in other circumstances where our assumptions are violated, what we still gain over doing it manually is that the \textit{intent} of the optimizations can be made explicit. Through judicious composition of simple rules, we can create rules that succinctly capture the original intent in code itself, without extensive comments or documentation. The important aspect of capturing intent is its relevance in building auditable software, which is key to building correct software.
+
+So far, OptiTrust has provided a compelling answer to the inherent shortcomings of DSL based systems like TVM and Exo. Whenever we have been unable to express a transformation with OptiTrust's standard library, we can make one of our own. We can expect to run into few language-level limitations this way, having nearly the full C language at our disposal. But we have not yet addressed how our accelerator code generation will look. We set aside this problem, representing accelerator instructions as C functions, which only take buffers in memory. Yet we know from TVM that this interface works poorly to represent instructions: we are actually interfacing with buffers that live in the accelerator. 
+
+It turns out there is a bigger problem, however. It is not possible to write inline assembly at all in OptiTrust. There are a number of C features which OptiTrust doesn't currently support, like function pointers, but inline assembly is slightly different. There is no C specification for the behavior of inline assembly. How does a tool like OptiTrust perform analysis a priori on some code utilizing inline assembly? This suggests that the features needed for high-performance programming in use cases like ours need more specification than merely the that of the language we write in (C). That is, this discipline of writing code for custom hardware employs behavior which is only specified in the ISA (which may not even be familiar to the compiler, like is the case here), and thus to do any of the meaningful static analysis we'd like with these constructs, we need some kind of corresponding specification which must be given by the user. As OptiTrust lacks this currently, we are unable to use its scheduling capabilities to use our hardware.
+
+\section{Conclusion}
+
+We have seen through the development of our convolution routine some important challenges in the discipline of high performance software development. Firstly, we saw the blowup in complexity caused by optimizing software: the representation we had which clearly correlated with the mathematical formula was lost when we made it run efficiently on our hardware. With nearly 5x the code length due to this process, we can see how writing high performance code can be time consuming to develop, debug, and maintain, especially as the source algorithm scales in complexity. Secondly, we know there is a serious penalty to overhead in these circumstances: as we build complex software (such as neural networks with billions of parameters) with these routines at the base, small differences in performance characteristics are amplified at the high level. Thirdly, we saw how necessary it was to have control over the low-level details of this software, sometimes down to the assembly level, to be able to program efficiently for the hardware. When this control cannot be exercised it may introduce an overhead which quickly becomes unacceptable.
+
+We saw how user-scheduled tools like TVM, Exo, and OptiTrust make huge strides in improving the development and maintainability of these sorts of programs. By separating concerns between algorithms and optimizations, we do not have to prove the correctness of an optimized routine, the complexity for which we saw, but only that we are applying correct-in-context transformations on a program with a well-understood correctness criterion. As explicit \textit{processes} to manipulate the algorithm itself, the optimizations we apply can also be made to be easily auditable. 
+
+Still, user-scheduled languages must contend with the remaining challenges posed in this space, namely the need for low-overhead control over hardware details. We saw with TVM how stopping short of explicit control over the accelerator instructions greatly reduced the benefit of the tool, as some of the most important details to the program had to be relegated to a program written by hand anyway. In response to these problems Exo provided a system for the programmer to better control instruction selection from the schedule itself, but we saw it eventually succomb to the same lack of expressibility under a niche, but relevant optimization case. We saw OptiTrust, a system which foregoes a domain specific language and opts for C-based source-to-source rewriting, handle these missed cases gracefully by allowing the programmer to express their own rewritings of the program's AST. Despite having nearly the full C language at our disposal, we were still limited in our ability to express our hardware-specific optimization as a verifiable rewrite in OptiTrust, as the semantics we relied on exist in the hardware, not in the language itself. To replace handwritten code, user-schedulable languages must deal with the common need to work with poorly-specified hardware constructs, and a wide range of generic language features, but need to grapple with performing meaningful static analysis.
+% TODO i think the conclusion should be redone a bit
+
+% show the im2col operation
+% replace the instructions 
+% show the library 
+% now talk about the indexing operations 
+% segue to optitrust, same as presentation
+% Show a subset of the conv1d optimization. "Optitrust supports many of the same scheduling directives as Exo and TVM. For example, here's how to do blah blah blah. Thanks to the extensibility of the language, you can also add transformations to do something yourself". Show how we implemented unification modulo windowing with our own expressions to extract windows.
+% But there's one thing that you cannot extend the language with, inherently. Since optitrust is bound to the C spec, it won't work with inline asm. That limits us once again, blah blah blah. 
+
+% Conclusion time, then future work
 
 
-% just give the basic unoptimized matmul in TVM IR
-
-% show how we can tile it with one of the scheduling operators
-
-% now we would like to replace the macc in the inner k loop with matmul
-% but we cannot, we have to replace a load/store as well
-% this isn't efficient
-
-% use amx as example
 
 \clearpage
 
