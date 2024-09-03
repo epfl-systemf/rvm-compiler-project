@@ -90,21 +90,7 @@ As a baseline, we implement a scalar-only version of this program in C in Listin
     baselinestretch=1.1,
     fontsize=\small,
     ]{cpp}
-void conv1d_cpu(int32_t *data, int32_t *kernels, int32_t *out) {
-    for (int i = 0; i < OC; i++) {
-        for (int j = 0; j < N; j++) {
-            out[i][j] = 0;
-            for (int c = 0; c < IC; c++) {
-                for (int r = 0; r < W; r++) {
-                    if ((j + r) < N) {
-                        out[i][j] += data[c][j + r]
-                            * kernels[i][c][r];
-                    }                    
-                }
-            }
-        }
-    }
-}
+
 \end{minted}
     \caption{conv1d scalar implementation}
     \label{lst:conv1d_scalar}
@@ -482,8 +468,9 @@ TVM_DLL int32_t matmul(void* args, int32_t* arg_type_ids, int32_t num_args,
       for (int32_t k_0 = 0; k_0 < 32; ++k_0) {
         int32_t cse_var_2 = (k_0 * 4);
         int32_t cse_var_1 = (i_0 * 512);
-        matmul_4x4_update((&(((float*)C)[(cse_var_1 + (j_0 * 4))])), (&(((float*)A)[(
-        cse_var_1 + cse_var_2)])), (&(((float*)B)[((j_0 * 512) + cse_var_2)])), 128);
+        matmul_4x4_update((&(((float*)C)[(cse_var_1 + (j_0 * 4))])),
+        (&(((float*)A)[(cse_var_1 + cse_var_2)])),
+        (&(((float*)B)[((j_0 * 512) + cse_var_2)])), 128);
       }
     }
   }
@@ -503,55 +490,53 @@ To introduce Exo, we will start by expressing the ``direct translation" convolut
 
 \begin{listing}
 \centering
+\caption{Base algorithm definition in Exo.}
 \begin{minted}[
     baselinestretch=1.1,
     fontsize=\small,
-]{python}
-# TODO: FIX THESE INDICES!
+    ]{python}
 @proc
 def generic_conv1d(
-    data: i32[C, W],
-    kernels: i32[K, C, R],
-    out: i32[K, W],
+    data: i32[IC, N],
+    kernels: i32[OC, IC, W],
+    out: i32[OC, N],
 ):
     # do the convolution
-    for k in seq(0, K):
-        for i in seq(0, W):
+    for i in seq(0, OC):
+        for j in seq(0, N):
             # zero out the result memory
-            out[k, i] = 0.0
-            for c in seq(0, C):
-                for r in seq(0, R):
+            out[i, j] = 0.0
+            for c in seq(0, IC):
+                for r in seq(0, W):
                     y: i32
-                    if i + r < W:
-                        y = data[c, i + r]
+                    if j + r < W:
+                        y = data[c, j + r]
                     else:
                         y = 0
-                    out[k, i] += kernels[k, c, r] * y
+                    out[i, j] += kernels[i, c, r] * y
 \end{minted}
-\caption{Base algorithm definition in Exo.}
-
 \label{lst:conv1d_scalar_exo}
 \end{listing}
 
 The structure closely resembles that of a real Python program, but like TVM, each construct in the code is compiled down to a representation within the Exo language. Now, we will apply scheduling directives to optimize it. We'll follow a slightly different order from the transformations applied by hand, as a certain order makes it easiest to express. Namely, we'd like to do all of our tiling beforehand, so we start with those directives:
-
 \begin{minted}[
     baselinestretch=1.1,
     fontsize=\small,
-]{python}
+    ]{python}
 # Before scheduling, grab cursors to the object code.
-k_loop = p.find("for k in _:_")
 i_loop = p.find("for i in _:_")
+j_loop = p.find("for j in _:_")
 c_loop = p.find("for c in _:_")
 y_alloc = p.find("y : _")
 y_assign = p.find("y = data[_]")
 
 # Tile outer loops to TILE size for RVM
-p, _ = tile_loops(p, [(k_loop, TILE), (i_loop, TILE)], perfect=True)
-p, _ = tile_loops(p, [(k_loop, 4)], perfect=True)
-k_loop_reg = p.find("for koi in _:_")
-p = reorder_loops(p, k_loop_reg)
+p, _ = tile_loops(p, [(i_loop, TILE), (j_loop, TILE)], perfect=True)
+p, _ = tile_loops(p, [(i_loop, 4)], perfect=True)
+i_loop_reg = p.find("for ioi in _:_")
+p = reorder_loops(p, i_loop_reg)
 \end{minted}
+
 In this snippet and those that come, \verb|p| refers to the \verb|generic_conv1d| function defined above, passed as an object to this function which manipulates the schedule. 
 
 Exo's scheduling directives need ``cursors'' that point to places in the program to manipulate. You can provide these as strings which are pattern matched against parts of the AST at the point the directive is applied, or grab a cursor to that node as an object, which is carried throughout transformations. Here we grab these references to the parts of the code we want to transform for convenience. Next, we apply a directive called \verb|tile_loops|, similar to \verb|split| from TVM, to tile these loop nests by the factor of the tile size. We tile once again to handle the 4x compute optimization. Finally, we reorder the loop corresponding to the 4 registers which we will unroll later.
@@ -560,41 +545,40 @@ If we print \verb|p| at this point using Exo, we get the following output:
 \begin{minted}[
     baselinestretch=1.1,
     fontsize=\small,
-]{python}
+    ]{python}
 def exo_conv1d_tile_lt_kw(data: i32[4, 16] @ DRAM,
                           kernels: i32[16, 4, 4] @ DRAM,
                           out: i32[16, 16] @ DRAM):
-    for koo in seq(0, 1):
-        for io in seq(0, 4):
-            for koi in seq(0, 4):
-                for ki in seq(0, 4):
-                    for ii in seq(0, 4):
-                        out[ki + 4 * (4 * koo + koi), ii + 4 * io] = 0.0
+    for ioo in seq(0, 1):
+        for jo in seq(0, 4):
+            for ioi in seq(0, 4):
+                for ii in seq(0, 4):
+                    for ji in seq(0, 4):
+                        out[ii + 4 * ioi + 16 * ioo, ji + 4 * jo] = 0.0
                         for c in seq(0, 4):
                             for r in seq(0, 4):
                                 y: i32 @ DRAM
-                                if ii + r + 4 * io < 16:
-                                    y = data[c, ii + r + 4 * io]
+                                if ji + r + 4 * jo < 4:
+                                    y = data[c, ji + r + 4 * jo]
                                 else:
                                     y = 0
-                                out[ki + 4 * (4 * koo + koi),
-                                    ii + 4 * io] += kernels[ki + 4 *
-                                                            (4 * koo + koi), c,
-                                                            r] * y
+                                out[ii + 4 * ioi + 16 * ioo, ji +
+                                    4 * jo] += kernels[ii + 4 * ioi + 16 * ioo,
+                                                       c, r] * y
 \end{minted}
 Now we would like to reorder the \verb|c| output to surround the inner tile dimensions, since inside each iteration of \verb|c| we'd like to do a single tile-size im2col and matrix multiplication. Exo won't let us reorder the loop with the initialization of \verb|out[]| in the way though,
 % (why?)
  so we will separate them out first. But we also want to stage \verb|out[]| to a new buffer, since the compute loop is only operating on the accelerator's memory, not directly to \verb|out[]| in the function signature. We will see later how to express that this buffer corresponds to the register held in our accelerator. 
 
 \begin{minted}[
-baselinestretch=1.1,
-fontsize=\small,
-]{python}
+    baselinestretch=1.1,
+    fontsize=\small,
+    ]{python}
 # Stage output to out_tile
 p, (_, out_tile, body, _) = auto_stage_mem(
     p, p.find_loop("c").expand(1, 0), "out", "out_tile", rc=True
 )
-p = autolift_alloc(p, out_tile, max_size=4 * 4 * 4, dep_set=["koi","ki","ii"])
+p = autolift_alloc(p, out_tile, max_size=4 * 4 * 4, dep_set=["ioi","ii","ji"])
 
 # Block the zero initialization and store blocks
 p = fission_as_much_as_possible(p, body)
@@ -652,32 +636,31 @@ After applying \verb|autolift_alloc|, we can fission (i.e. separate the statemen
 def exo_conv1d_tile_lt_kw(data: i32[4, 16] @ DRAM,
                           kernels: i32[16, 4, 4] @ DRAM,
                           out: i32[16, 16] @ DRAM):
-    for koo in seq(0, 1):
-        for io in seq(0, 4):
+    for ioo in seq(0, 1):
+        for jo in seq(0, 4):
             out_tile: i32[4, 4, 4] @ DRAM
-            for koi in seq(0, 4):
-                for ki in seq(0, 4):
-                    for ii in seq(0, 4):
-                        out_tile[koi, ki, ii] = 0.0
+            for ioi in seq(0, 4):
+                for ii in seq(0, 4):
+                    for ji in seq(0, 4):
+                        out_tile[ioi, ii, ji] = 0.0
             for c in seq(0, 4):
-                for koi in seq(0, 4):
-                    for ki in seq(0, 4):
-                        for ii in seq(0, 4):
+                for ioi in seq(0, 4):
+                    for ii in seq(0, 4):
+                        for ji in seq(0, 4):
                             for r in seq(0, 4):
                                 y: i32 @ DRAM
-                                if ii + r + 4 * io < 16:
-                                    y = data[c, ii + r + 4 * io]
+                                if ji + r + 4 * jo < 4:
+                                    y = data[c, ji + r + 4 * jo]
                                 else:
                                     y = 0
-                                out_tile[koi, ki,
-                                         ii] += kernels[ki + 4 *
-                                                        (4 * koo + koi), c,
-                                                        r] * y
-            for koi in seq(0, 4):
-                for ki in seq(0, 4):
-                    for ii in seq(0, 4):
-                        out[ki + 4 * (4 * koo + koi),
-                            ii + 4 * io] = out_tile[koi, ki, ii]
+                                out_tile[ioi, ii,
+                                         ji] += kernels[ii + 4 * ioi +
+                                                        16 * ioo, c, r] * y
+            for ioi in seq(0, 4):
+                for ii in seq(0, 4):
+                    for ji in seq(0, 4):
+                        out[ii + 4 * ioi + 16 * ioo,
+                            ji + 4 * jo] = out_tile[ioi, ii, ji]
 \end{minted}
 
 We still have to apply the im2col transformation, where we separate out the setting of \verb|y| into its own loop nest, making \verb|y| a large buffer in the process. We can see that this is a simple matter of applying fission between setting \verb|y| and doing the multiply-accumulate, then lifting the \verb|y| allocation up the loop nest. Afterwards, we stage the kernel and data matrices into new buffers just like with the output. We have:
@@ -687,7 +670,7 @@ We still have to apply the im2col transformation, where we separate out the sett
     fontsize=\small,
     ]{python}
 # Stage y
-p = autolift_alloc(p, y_alloc, max_size=4 * 4, dep_set=["r","ii"])
+p = autolift_alloc(p, y_alloc, max_size=4 * 4, dep_set=["r","ji"])
 p = lift_alloc(p, y_alloc, n_lifts=2)
 
 # Fission the initialization loop and remove redundant loops
@@ -695,14 +678,14 @@ p = fission_as_much_as_possible(p, y_assign.parent())
 p = remove_redundant_loops(p, y_assign.parent(), num=2)
 
 # Stage kernels to kernel_tile and y to data_tile
-ki_loop = p.forward(c_loop).body()[2].body()[0]
+ii_loop = p.forward(c_loop).body()[2].body()[0]
 p, (kernel_alloc, _, _, _) = auto_stage_mem(
-    p, ki_loop, "kernels", "kernel_tile", rc=True
+    p, ii_loop, "kernels", "kernel_tile", rc=True
 )
-p = simplify(expand_dim(p, kernel_alloc, 4, ki_loop.parent().name()))
+p = simplify(expand_dim(p, kernel_alloc, 4, ii_loop.parent().name()))
 p = lift_alloc(p, kernel_alloc)
 p, (data_alloc, _, _, _) = auto_stage_mem(
-    p, ki_loop.parent(), "y", "data_tile", rc=True
+    p, ii_loop.parent(), "y", "data_tile", rc=True
 )
 \end{minted}
 
@@ -721,8 +704,8 @@ We are now ready to replace the loops in this code with offloads to our accelera
     fontsize=\small,
     ]{python}
 @instr(
-    'asm volatile("mld.w "{dst_int}", (%1), %0"\
-    :: "r"(4*({src}.strides[0])), "r"(&{src_data}));'
+    'asm volatile("mld.w "{dst_int}", (%1), %0" :: \
+        "r"(4*({src}.strides[0])), "r"(&{src_data}));'
 )
 def rvm_mld(dst: [i32][4, 4] @ RVM_TILE, src: [i32][4, 4] @ DRAM):
     assert stride(src, 1) == 1
@@ -817,34 +800,34 @@ The resulting Exo code has all offloadable sections replaced by calls to the fun
 def exo_conv1d_tile_lt_kw(data: i32[4, 16] @ DRAM,
                           kernels: i32[16, 4, 4] @ DRAM,
                           out: i32[16, 16] @ DRAM):
-    for koo in seq(0, 1):
-        for io in seq(0, 4):
+    for ioo in seq(0, 1):
+        for jo in seq(0, 4):
             out_tile: i32[4, 4, 4] @ RVM_TILE
-            for koi in seq(0, 4):
-                rvm_mzero(out_tile[koi + 0, 0:4, 0:4])
+            for ioi in seq(0, 4):
+                rvm_mzero(out_tile[ioi, 0:4, 0:4])
             for c in seq(0, 4):
                 y: i32[4, 4] @ DRAM_STATIC
-                for ii in seq(0, 4):
+                for ji in seq(0, 4):
                     for r in seq(0, 4):
-                        if ii + r + 4 * io < 16:
-                            y[ii, r] = data[c, ii + r + 4 * io]
+                        if ji + r + 4 * jo < 4:
+                            y[ji, r] = data[c, ji + r + 4 * jo]
                         else:
-                            y[ii, r] = 0
+                            y[ji, r] = 0
                 kernel_tile: i32[4, 4, 4] @ RVM_TILE
-                data_tile: i32[4 - 0, 4 - 0] @ RVM_TILE
+                data_tile: i32[4, 4] @ RVM_TILE
                 rvm_mld(data_tile[0:4, 0:4], y[0:4, 0:4])
-                for koi in seq(0, 4):
+                for ioi in seq(0, 4):
                     rvm_mld(
-                        kernel_tile[koi + 0, 0:4, 0:4],
-                        kernels[4 * koi + 16 * koo + 0:4 * koi + 16 * koo + 4,
-                                c + 0, 0:4])
-                    rvm_mmasa(out_tile[koi + 0, 0:4, 0:4], data_tile[0:4, 0:4],
-                              kernel_tile[koi + 0, 0:4, 0:4])
-            for koi in seq(0, 4):
+                        kernel_tile[ioi, 0:4, 0:4],
+                        kernels[4 * ioi + 16 * ioo:4 + 4 * ioi + 16 * ioo, c,
+                                0:4])
+                    rvm_mmasa(out_tile[ioi, 0:4, 0:4], data_tile[0:4, 0:4],
+                              kernel_tile[ioi, 0:4, 0:4])
+            for ioi in seq(0, 4):
                 rvm_mst(
-                    out_tile[koi + 0, 0:4, 0:4],
-                    out[4 * koi + 16 * koo + 0:4 * koi + 16 * koo + 4,
-                        4 * io + 0:4 * io + 4])
+                    out_tile[ioi, 0:4, 0:4],
+                    out[4 * ioi + 16 * ioo:4 + 4 * ioi + 16 * ioo,
+                        4 * jo:4 + 4 * jo])
 \end{minted}
 
 For our final transformations, we'd like to unroll each of the \verb|koi| loops, and allocate 4 different \verb|out_tile|s, rather than having only one with an extra dimension. Exo provides us with a routine to unroll loops, but also to ``unroll the buffer'': replace an allocation for a constant size $n$ on a given dimension with $n$ buffers without that dimension. We utilize these directives below.
@@ -1011,3 +994,29 @@ Still, user-scheduled languages must contend with the remaining challenges posed
 % make sure to put an appendix with all the little things which would be useful for someone to know
 
 \end{document}
+
+\begin{minted}[
+    baselinestretch=1.1,
+    fontsize=\small,
+]{python}
+# TODO: FIX THESE INDICES!
+@proc
+def generic_conv1d(
+    data: i32[C, W],
+    kernels: i32[K, C, R],
+    out: i32[K, W],
+):
+    # do the convolution
+    for k in seq(0, K):
+        for i in seq(0, W):
+            # zero out the result memory
+            out[k, i] = 0.0
+            for c in seq(0, C):
+                for r in seq(0, R):
+                    y: i32
+                    if i + r < W:
+                        y = data[c, i + r]
+                    else:
+                        y = 0
+                    out[k, i] += kernels[k, c, r] * y
+\end{minted}

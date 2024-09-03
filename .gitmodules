@@ -1,0 +1,3 @@
+[submodule "src/optitrust-rvm"]
+	path = src/optitrust-rvm
+	url = git@gitlab.epfl.ch:systemf/optitrust-rvm.git
