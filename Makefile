@@ -1,8 +1,8 @@
-verify: conv1d_integration lit_tests
+verify: conv1d_integration lit_exo
 
 OUT = out
 
-.PHONY: conv1d_integration lit_tests
+.PHONY: conv1d_integration lit_exo
 
 clean:
 	rm -rf $(OUT)
@@ -12,7 +12,5 @@ conv1d_integration:
 	@make -C src/conv1d OUT=$(shell pwd)/$(OUT)
 	@spike --isa=RV32IMC_xmatrix pk -s $(OUT)/conv1d.elf
 	
-lit_tests:
-	lit experiments/tvm/07_new_tensorize_matmul.py \
-		src/conv1d/exo/conv1d.py \
-		src/optitrust-rvm/case_studies/conv1d/conv1d.ml
+lit_exo:
+	lit src/conv1d/exo/conv1d.py

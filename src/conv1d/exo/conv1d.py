@@ -34,7 +34,7 @@ def gen_conv1d():
                 for c in seq(0, IC):
                     for r in seq(0, W):
                         y: i32
-                        if j + r < W:
+                        if j + r < N:
                             y = data[c, j + r]
                         else:
                             y = 0
@@ -61,6 +61,8 @@ class RVM_TILE(StaticMemory):
 
     @classmethod
     def alloc(cls, new_name, prim_type, shape, srcinfo):
+        if not (len(shape) == 2):
+            raise MemGenError("Must be a 2D tile.")
         if not (shape[0].isdecimal() and int(shape[0]) == 4):
             raise MemGenError("Number of tile rows must be 4.")
         if not (shape[1].isdecimal() and int(shape[1]) == 4):
@@ -349,7 +351,7 @@ def optimize_conv(p):
 # CHECK:                         for c in seq(0, 4):
 # CHECK:                             for r in seq(0, 4):
 # CHECK:                                 y: i32 @ DRAM
-# CHECK:                                 if ji + r + 4 * jo < 4:
+# CHECK:                                 if ji + r + 4 * jo < 16:
 # CHECK:                                     y = data[c, ji + r + 4 * jo]
 # CHECK:                                 else:
 # CHECK:                                     y = 0
@@ -358,7 +360,7 @@ def optimize_conv(p):
 # CHECK:                                                        c, r] * y
 
     # Stage output to out_tile
-    p, (_, out_tile, body, _) = auto_stage_mem(
+    p, (out_alloc, out_tile, body, _) = auto_stage_mem(
         p, p.find_loop("c").expand(1, 0), "out", "out_tile", rc=True
     )
     p = autolift_alloc(p, out_tile, max_size=4 * 4 * 4, dep_set=["ioi","ii","ji"])
@@ -387,7 +389,7 @@ def optimize_conv(p):
 # CHECK:                         for ji in seq(0, 4):
 # CHECK:                             for r in seq(0, 4):
 # CHECK:                                 y: i32 @ DRAM
-# CHECK:                                 if ji + r + 4 * jo < 4:
+# CHECK:                                 if ji + r + 4 * jo < 16:
 # CHECK:                                     y = data[c, ji + r + 4 * jo]
 # CHECK:                                 else:
 # CHECK:                                     y = 0
@@ -441,7 +443,7 @@ def optimize_conv(p):
 # CHECK:                 y: i32[4, 4] @ DRAM_STATIC
 # CHECK:                 for ji in seq(0, 4):
 # CHECK:                     for r in seq(0, 4):
-# CHECK:                         if ji + r + 4 * jo < 4:
+# CHECK:                         if ji + r + 4 * jo < 16:
 # CHECK:                             y[ji, r] = data[c, ji + r + 4 * jo]
 # CHECK:                         else:
 # CHECK:                             y[ji, r] = 0
@@ -468,6 +470,7 @@ def optimize_conv(p):
     p = simplify(p)
     p = unroll_buffer(p, kernel_alloc, 0)
     p = reuse_buffer(p, "kernel_tile_0: _", "kernel_tile_3: _")
+    p = unroll_buffer(p, "out_tile", 0)
     
     return p
 

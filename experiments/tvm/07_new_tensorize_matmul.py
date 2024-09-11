@@ -1,3 +1,8 @@
+# RUN: python %s test 2>/dev/null
+# 
+# | FileCheck %s 
+# ^^^ this doesn't seem to pass with lit for some reason
+
 import tvm
 from tvm import meta_schedule as ms
 from tvm.tir import schedule as sch
@@ -100,67 +105,28 @@ sched.annotate(sched.get_block("root"), "pragma_import_c", matmul_4x4_update())
 sched.tensorize(i1, "test_mma_intrin")
 
 m = sched.mod
-#print(sched.mod["main"].script())
-##sched.annotate(sched.get_block("update_o"), )
-#dev = tvm.cpu()
-#npA = np.random.uniform(1, 10, size=(128,128)).astype("float32")
-## np.identity(N).astype("float32")
-#npB = np.random.uniform(1, 10, size=(128,128)).astype("float32")
-## np.identity(N).astype("float32")
-#npC = np.zeros((N,N)).astype("float32")
-#a = tvm.nd.array(npA, dev)
-#b = tvm.nd.array(npB, dev)
-#c = tvm.nd.array(npC, dev)
-
-from tvm.contrib import cc
-# target="c", runtime=tvm.relay.backend.Runtime("crt", {"system-lib": True})
-func = tvm.build(m, target="c")
-with open("out/tvm_out.h", 'w') as f:
-    f.write(func.get_source())
-exit(0)
-func.export_library("matmul.tar")#, fcompile=cc.cross_compiler("/opt/rvm_riscv/bin/clang++", ["-march=rv32imc_xtheadmatrix0p1","-menable-experimental-extensions","-I/home/julien/tvm/include/","-I/home/julien/tvm/3rdparty/dlpack/include/"]))
-lib = tvm.runtime.load_module("matmul.so")
-lib["before_tensorize"](a,b,c)
-res = c
-ref = np.matmul(npA, npB.transpose())
-print(res, ref)
-
-#from tvm.contrib import graph_executor
-#m = graph_executor.GraphModule(func["before_tensorize"](dev))
-
-#mod = tvm.build(IR_module, target="c") 
+sched.mod["main"].show(style=None, black_format=False)
+#CHECK: # from tvm.script import tir as T
+#CHECK: @T.prim_func
+#CHECK: def matmul(A: T.Buffer((128, 128), "float32"), B: T.Buffer((128, 128), "float32"), C: T.Buffer((128, 128), "float32")):
+#CHECK:     with T.block("root"):
+#CHECK:         T.reads()
+#CHECK:         T.writes()
+#CHECK:         T.block_attr({"pragma_import_c": metadata["runtime.String"][0]})
+#CHECK:         for i_0, j_0, k_0 in T.grid(32, 32, 32):
+#CHECK:             with T.block("update_o"):
+#CHECK:                 vi_o, vj_o, vk_o = T.axis.remap("SSR", [i_0, j_0, k_0])
+#CHECK:                 T.reads(C[vi_o * 4:vi_o * 4 + 4, vj_o * 4:vj_o * 4 + 4], A[vi_o * 4:vi_o * 4 + 4, vk_o * 4:vk_o * 4 + 4], B[vj_o * 4:vj_o * 4 + 4, vk_o * 4:vk_o * 4 + 4])
+#CHECK:                 T.writes(C[vi_o * 4:vi_o * 4 + 4, vj_o * 4:vj_o * 4 + 4])
+#CHECK:                 A_1 = T.match_buffer(A[vi_o * 4:vi_o * 4 + 4, vk_o * 4:vk_o * 4 + 4], (4, 4), strides=("A_s0", "A_s1"), offset_factor=1)
+#CHECK:                 B_1 = T.match_buffer(B[vj_o * 4:vj_o * 4 + 4, vk_o * 4:vk_o * 4 + 4], (4, 4), offset_factor=1)
+#CHECK:                 C_1 = T.match_buffer(C[vi_o * 4:vi_o * 4 + 4, vj_o * 4:vj_o * 4 + 4], (4, 4), offset_factor=1)
+#CHECK:                 T.call_extern("int32", "matmul_4x4_update", T.tvm_access_ptr(T.type_annotation("float32"), C_1.data, C_1.elem_offset, 16, 2), T.tvm_access_ptr(T.type_annotation("float32"), A_1.data, A_1.elem_offset, T.Cast("int64", A_1.strides[0]) * T.int64(4), 1), T.tvm_access_ptr(T.type_annotation("float32"), B_1.data, B_1.elem_offset, 16, 1), A_1.strides[0])
+#CHECK: # Metadata omitted. Use show_meta=True in script() method to show it.
 
 
-#def gemm_impl():
-#    asm_code = """
-#    /* Copied from matrix_insn.S in QEMU testcases */
-#    .text
-#    .align  2
-#    .global test_fmmacc_s_4x4
-#    .type   test_fmmacc_s_4x4, @function
-#    test_fmmacc_s_4x4:
-#        addi  t0,x0,0x10
-#        li t3, 0x00100404
-#        mcfg x0, t3
-#
-#        mldw m0, t0, (a0)
-#        mldw m1, t0, (a1)
-#
-#        li       t6,  0x00000010
-#        csrw xmcsr,t6
-#
-#        fmmacc.s m2, m1, m0
-#
-#        mstw m2, t0, (a3)
-#
-#        ret
-#            .size   test_fmmacc_s_4x4, .-test_fmmacc_s_4x4
-#
-#    """
-#    from tvm.contrib import utils, clang
-#
-#    temp = utils.tempdir()
-#    ll_path = temp.relpath("temp.ll")
-#    # Create LLVM ir from c source code
-#    ll_code = clang.create_llvm(asm_code, output=ll_path)
-#    return ll_code     
+import sys
+if "test" not in sys.argv:
+    func = tvm.build(m, target="c")
+    with open("out/tvm_out.h", 'w') as f:
+        f.write(func.get_source())

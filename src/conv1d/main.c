@@ -100,9 +100,9 @@ void conv1d_tile_lt_kw_reord(int32_t *data, int32_t *kernels, int32_t *out)
             asm volatile("mst.w m4, (%1), %0" ::"r"(N * 4), "r"(outptr + TILE*N*3));
 
             data_base += TILE;
-            kernel_base -= N * IC;
+            kernel_base -= W * IC;
         }
-        kernel_base += TILE * IC * N*4;
+        kernel_base += TILE * IC * W*4;
     }
 }
 

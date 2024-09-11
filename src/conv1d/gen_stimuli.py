@@ -72,15 +72,6 @@ for i in range(0,OC):
                 sum += kernel[(IC * i + w_j)*W + w_i] * data_at_idx
         expected.append(sum)
 
-#for i in range(0,SIZE):
-#    for j in range(0,SIZE):
-#        r = 0
-#
-#        for k in range (0,SIZE):
-#            r = r + m_a[i * SIZE + k] * m_b[j * SIZE + k]
-#
-#        m_exp.append(r)
-
 
 write_arr(f, 'DATA'  ,   data, 'int32_t __attribute__((section(".xheep_data_interleaved")))', IC * N, 128)
 write_arr(f, 'KERNELS' ,   kernel, 'int32_t __attribute__((section(".xheep_data_interleaved")))', OC * IC * W, 128)

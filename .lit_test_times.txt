@@ -1,4 +1,4 @@
-3.305434e+00 src/conv1d/exo/conv1d.py
+3.018358e+00 src/conv1d/exo/conv1d.py
 -7.510185e-04 src/conv1d/gen_stimuli.py
 -1.280069e-03 src/optitrust-rvm/case_studies/matmul/bench.py
 -7.879734e-04 src/optitrust-rvm/generate_doc.py
@@ -18,7 +18,7 @@
 -1.144409e-04 experiments/tvm/04_matrix_add_tensorize.py
 -1.170635e-04 experiments/tvm/05_increments_to_integration_test.py
 -1.485348e-04 experiments/tvm/06_orig_tensorize_matmul.py
--6.802082e-04 experiments/tvm/07_new_tensorize_matmul.py
+-5.157647e-01 experiments/tvm/07_new_tensorize_matmul.py
 -1.082420e-04 experiments/tvm/08_rpc_experimentation.py
 -2.295971e-04 experiments/tvm/09_new_tensorize_matmul_llvm.py
 -1.904964e-04 experiments/tvm/10_autotensorize_c_spatial.py
@@ -87,4 +87,4 @@
 -2.355576e-04 src/optitrust-rvm/case_studies/pic/src/random.c
 -2.102852e-04 src/optitrust-rvm/case_studies/pic/src/rho.c
 -1.637936e-04 src/optitrust-rvm/case_studies/pic/src/space_filling_curves.c
--7.221699e-04 src/optitrust-rvm/case_studies/conv1d/conv1d.ml
+-1.210213e-03 src/optitrust-rvm/case_studies/conv1d/conv1d.ml
