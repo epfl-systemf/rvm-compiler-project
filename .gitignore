@@ -16,3 +16,4 @@
 __pycache__
 out/
 Output/
+.lit_test_times.txt
