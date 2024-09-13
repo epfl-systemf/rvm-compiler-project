@@ -1,8 +1,8 @@
-verify: conv1d_integration lit_exo lit_optitrust
+verify: conv1d_integration lit_tests
 
 OUT = out
 
-.PHONY: conv1d_integration lit_exo lit_optitrust
+.PHONY: conv1d_integration lit_tests
 
 clean:
 	rm -rf $(OUT)
@@ -12,8 +12,6 @@ conv1d_integration:
 	@make -C src/conv1d OUT=$(shell pwd)/$(OUT)
 	@spike --isa=RV32IMC_xmatrix pk -s $(OUT)/conv1d.elf
 	
-lit_exo:
-	lit src/conv1d/exo/conv1d.py
-
-lit_optitrust:
-	lit src/optitrust-rvm/case_studies/conv1d/conv1d.ml -v
+lit_tests:
+	lit src/conv1d/exo/conv1d.py \
+		src/optitrust-rvm/case_studies/conv1d/conv1d.ml -v

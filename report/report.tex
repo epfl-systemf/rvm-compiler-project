@@ -55,19 +55,19 @@ In addition, the accelerator does not have to honor false dependencies, where th
 %--
 
 \begin{table}[h]
-\begin{tabular}{|c|c|c|c|}
+\begin{tabular}{ c c c c }
 \multicolumn{4}{c}{arithmetic instructions} \\ \hline\hline
 format & operand type & accumulator type & description \\ \hline
 \verb|fmmacc.s md, ms1, ms2| & \verb|fp32| & \verb|fp32|  & \multirow{4}{*}{$\texttt{md} \pluseq \texttt{ms1}\cdot \texttt{ms2}^T$} \\ 
-\verb|mmasa.w md, ms1, ms2| & \verb|int32| & \verb|int32| & \\
-\verb|mmada.h md, ms1, ms2| & \verb|int16| & \verb|int32| & \\
-\verb|mmaqa.b md, ms1, ms2| & \verb|int8| & \verb|int32| & \\
-\hline\hline
+\verb| mmasa.w md, ms1, ms2| & \verb|int32| & \verb|int32| & \\
+\verb| mmada.h md, ms1, ms2| & \verb|int16| & \verb|int32| & \\
+\verb| mmaqa.b md, ms1, ms2| & \verb|int8| & \verb|int32| & \\
+\\
 \multicolumn{4}{c}{load, store, misc} \\ \hline\hline
-format & \multicolumn{3}{c|}{description} \\ \hline
-\verb|mzero md| & \multicolumn{3}{c|}{clear register \texttt{md}} \\
-\verb|mld.w md, (rs1), rs2| & \multicolumn{3}{c|}{load matrix from \texttt{rs1} into register \texttt{md}, with byte row stride \texttt{rs2}} \\
-\verb|mst.w ms1, (rs1), rs2| & \multicolumn{3}{c|}{store matrix in register \texttt{ms1} to \texttt{rs1}, with byte row stride \texttt{rs2}} \\ \hline
+format & \multicolumn{3}{c }{description} \\ \hline
+\verb|mzero md| & \multicolumn{3}{c}{clear register \texttt{md}} \\
+\verb|mld.w md, (rs1), rs2| & \multicolumn{3}{c }{load matrix from \texttt{rs1} into register \texttt{md}, with byte row stride \texttt{rs2}} \\
+\verb|mst.w ms1, (rs1), rs2| & \multicolumn{3}{c}{store matrix in register \texttt{ms1} to \texttt{rs1}, with byte row stride \texttt{rs2}} \\ \hline
 \end{tabular}
 \caption{Instruction listing. \texttt{mX} = tile register, \texttt{rX} = general purpose register.}
 \label{tbl:isa}
@@ -965,7 +965,7 @@ We have seen through the development of our convolution routine some important c
 
 We saw how user-scheduled languages like TVM, Exo, and OptiTrust make huge strides in improving the development and maintainability of these sorts of programs. By separating concerns between algorithms and optimizations, we do not have to reason about the correctness of an optimized routine, the complexity for which we saw, but only that we are applying correct-in-context transformations on a program with a well-understood correctness criterion. Reasoning in this sense applies to both machines and humans: as explicit \textit{processes} to manipulate the algorithm itself, the optimizations we apply can also be made to be easily auditable. 
 
-Still, user-scheduled languages must contend with the remaining challenges posed in this space, namely the need for low-overhead control over hardware details. We saw how TVM's limited granularity over the output code generation greatly diminished its utility as a productivity tool, as some of the most important details of the program had to be delegated to a program written by hand anyway, or to a compiler backend which needs to handle the most general cases. In the face of these problems with existing user-scheduled languages, Exo allowed for the hardware-specific details such as instruction selection or custom memory managment to be incorporated the schedule itself.  Thanks to these advances, Exo ended up being the only tool we investigated which could replicate an optimized routine utilizing our accelerator. However, the code it produced still fell short of what we wrote by hand in C, by writing array index operations in a specific way. As with TVM, the language hid these details from us. We then saw OptiTrust, a system which foregoes a domain specific language and opts for C-based source-to-source rewriting, handling these missed cases gracefully by allowing the programmer to express their own rewritings of the program's AST. Despite having nearly the full C language at our disposal, we were still limited in our ability to express our hardware-specific optimization as a verifiable rewrite in OptiTrust, as the semantics we relied on exist in the hardware, not in the language itself.
+Still, user-scheduled languages must contend with the remaining challenges posed in this space, namely the need for low-overhead control over hardware details. We saw how TVM's limited granularity over the output code generation diminished its utility as a productivity tool, as some of the most important details of the program had to be delegated to a program written by hand anyway, or to a compiler backend which needs to handle the most general cases. In the face of these problems with existing user-scheduled languages, Exo allowed for the hardware-specific details such as instruction selection or custom memory managment to be incorporated the schedule itself.  Thanks to these advances, Exo ended up being the only tool we investigated which could replicate an optimized routine utilizing our accelerator. However, the code it produced still fell short of what we wrote by hand in C, by writing array index operations in a specific way. As with TVM, the language hid these details from us. We then saw OptiTrust, a system which foregoes a domain specific language and opts for C-based source-to-source rewriting, handling these missed cases gracefully by allowing the programmer to express their own rewritings of the program's AST. Despite having nearly the full C language at our disposal, we were still limited in our ability to express our hardware-specific optimization as a verifiable rewrite in OptiTrust, as the semantics we relied on exist in the hardware, not in the language itself.
 
 To replace handwritten code in the domain we investigated, user-schedulable languages have to balance these needs for extensive control over bespoke hardware and access to general-purpose language features. These needs are further complicated by the desire to perform meaningful static analysis on transformations carried out within the tool. Nevertheless, the productivity improvements proposed by user-scheduled languages are often strong enough to outweigh the disadvantages of losing some amount of performance, and as such they are proving to be a powerful paradigm in the space of high-performance software development. 
 
