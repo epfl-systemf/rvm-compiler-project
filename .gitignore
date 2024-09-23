@@ -12,6 +12,7 @@
 *.nav
 *.snm
 *.toc
+*.xdv
 *_minted*
 __pycache__
 out/
